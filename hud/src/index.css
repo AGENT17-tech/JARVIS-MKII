@@ -1,0 +1,21 @@
+@import url('https://fonts.googleapis.com/css2?family=Orbitron:wght@400;600;700;900&family=Share+Tech+Mono&family=Exo+2:wght@300;400;600&display=swap');
+
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+body {
+  background: transparent;
+  overflow: hidden;
+  width: 100vw;
+  height: 100vh;
+  font-family: 'Exo 2', sans-serif;
+  color: #00d4ff;
+}
+
+#root {
+  width: 100vw;
+  height: 100vh;
+}

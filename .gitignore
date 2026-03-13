@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.env
+*.db
+*.wav
+screenshots/
+ 
+# Node
+node_modules/
+dist/
+build/
+.vite/
+ 
+# OS
+.DS_Store
+Thumbs.db
+ 
+# Logs
+*.log
