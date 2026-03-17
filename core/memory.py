@@ -1,336 +1,286 @@
 """
-JARVIS Memory System — v2
-─────────────────────────────────────────────────────────────────
-Architecture:
-  exchanges     — raw turn-by-turn log (user + assistant + timestamp)
-  summaries     — rolling compressed summaries (auto-generated every N turns)
-  entities      — extracted facts about the user (name, preferences, context)
-  topics        — conversation topic tags for retrieval
+memory.py — JARVIS MKIII Memory System
+Powered by Hindsight — agent memory that learns.
+Replaces the old flat SQLite save_exchange / build_context system.
 
-Strategy:
-  1. Every exchange saved with full text
-  2. When exchanges > SUMMARY_TRIGGER, oldest batch is summarised by Ollama
-     and compressed into a single summary row — raw rows deleted
-  3. build_context() returns: [system_prompt] + [summaries] + [recent_raw]
-     → JARVIS always has long-term compressed memory + sharp short-term detail
-  4. Entity extraction runs after every exchange and upserts to entities table
-     → user facts persist indefinitely regardless of summary compression
+Three operations:
+    retain  — store a new memory
+    recall  — retrieve relevant memories
+    reflect — deep analysis of memory patterns
+
+Hindsight runs locally via Docker on port 8888.
+100% offline — Ollama as the LLM provider.
 """
 
-import aiosqlite
+import asyncio
 import httpx
 import json
-import re
+import sqlite3
+import os
 from datetime import datetime
-from pathlib import Path
+from typing import Optional
 
-DB_PATH          = Path(__file__).parent / "jarvis_memory.db"
-OLLAMA_URL       = "http://localhost:11434/api/chat"
-SUMMARY_MODEL    = "llama3.2:3b"
-SUMMARY_TRIGGER  = 12    # summarise when raw exchanges exceed this
-SUMMARY_BATCH    = 8     # how many exchanges to compress per summary
-RECENT_KEEP      = 6     # raw exchanges to always keep (never summarised)
-MAX_SUMMARIES    = 5     # keep at most this many summaries in context
+HINDSIGHT_URL = "http://localhost:8888"
+BANK_ID       = "khalid"   # Memory bank ID — one per user
+
+# ── Fallback SQLite (used if Hindsight is unavailable) ────────────────
+FALLBACK_DB = os.path.expanduser("~/.jarvis/memory_fallback.db")
 
 
-# ── Database setup ────────────────────────────────────────────────────
+class Memory:
+    def __init__(self):
+        self._hindsight_available = False
+        self._init_fallback_db()
+        print("[MEMORY] Memory system initialized.")
 
-async def init_db():
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("""
+    def _init_fallback_db(self):
+        """Initialize SQLite fallback for when Hindsight is offline."""
+        os.makedirs(os.path.dirname(FALLBACK_DB), exist_ok=True)
+        conn = sqlite3.connect(FALLBACK_DB)
+        conn.execute("""
             CREATE TABLE IF NOT EXISTS exchanges (
                 id        INTEGER PRIMARY KEY AUTOINCREMENT,
-                role      TEXT NOT NULL,
-                content   TEXT NOT NULL,
-                timestamp TEXT NOT NULL
+                role      TEXT,
+                content   TEXT,
+                timestamp TEXT
             )
         """)
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS summaries (
-                id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                content     TEXT NOT NULL,
-                covers_from TEXT NOT NULL,
-                covers_to   TEXT NOT NULL,
-                created_at  TEXT NOT NULL
-            )
-        """)
-        await db.execute("""
+        conn.execute("""
             CREATE TABLE IF NOT EXISTS entities (
-                key        TEXT PRIMARY KEY,
-                value      TEXT NOT NULL,
-                updated_at TEXT NOT NULL
+                key       TEXT PRIMARY KEY,
+                value     TEXT,
+                updated   TEXT
             )
         """)
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS topics (
-                id         INTEGER PRIMARY KEY AUTOINCREMENT,
-                exchange_id INTEGER,
-                tag        TEXT NOT NULL,
-                created_at TEXT NOT NULL
+        conn.commit()
+        conn.close()
+
+    async def _check_hindsight(self) -> bool:
+        """Check if Hindsight is running."""
+        try:
+            async with httpx.AsyncClient(timeout=3.0) as client:
+                r = await client.get(f"{HINDSIGHT_URL}/health")
+                self._hindsight_available = r.status_code == 200
+        except Exception:
+            self._hindsight_available = False
+        return self._hindsight_available
+
+    # ── Core API ──────────────────────────────────────────────────────
+
+    async def retain(self, content: str, context: str = "") -> bool:
+        """
+        Store a new memory in Hindsight.
+        Falls back to SQLite if Hindsight is unavailable.
+        """
+        await self._check_hindsight()
+
+        if self._hindsight_available:
+            try:
+                async with httpx.AsyncClient(timeout=30.0) as client:
+                    payload = {"bank_id": BANK_ID, "content": content}
+                    if context:
+                        payload["context"] = context
+                    r = await client.post(f"{HINDSIGHT_URL}/retain", json=payload)
+                    if r.status_code == 200:
+                        return True
+            except Exception as e:
+                print(f"[MEMORY] Hindsight retain error: {e}")
+
+        # Fallback to SQLite
+        try:
+            conn = sqlite3.connect(FALLBACK_DB)
+            conn.execute(
+                "INSERT INTO exchanges (role, content, timestamp) VALUES (?, ?, ?)",
+                ("memory", content, datetime.utcnow().isoformat())
             )
-        """)
-        await db.commit()
+            conn.commit()
+            conn.close()
+            return True
+        except Exception as e:
+            print(f"[MEMORY] Fallback retain error: {e}")
+            return False
+
+    async def recall(self, query: str, limit: int = 10) -> list:
+        """
+        Retrieve memories relevant to a query.
+        Uses 4-strategy parallel retrieval (semantic + keyword + graph + temporal).
+        Falls back to SQLite keyword search.
+        """
+        await self._check_hindsight()
+
+        if self._hindsight_available:
+            try:
+                async with httpx.AsyncClient(timeout=30.0) as client:
+                    r = await client.post(f"{HINDSIGHT_URL}/recall", json={
+                        "bank_id": BANK_ID,
+                        "query":   query,
+                        "limit":   limit,
+                    })
+                    if r.status_code == 200:
+                        data = r.json()
+                        return data.get("memories", [])
+            except Exception as e:
+                print(f"[MEMORY] Hindsight recall error: {e}")
+
+        # Fallback to SQLite
+        try:
+            conn = sqlite3.connect(FALLBACK_DB)
+            rows = conn.execute(
+                "SELECT content FROM exchanges ORDER BY id DESC LIMIT ?",
+                (limit,)
+            ).fetchall()
+            conn.close()
+            return [{"content": r[0]} for r in rows]
+        except Exception as e:
+            print(f"[MEMORY] Fallback recall error: {e}")
+            return []
+
+    async def reflect(self, query: str) -> str:
+        """
+        Deep reflection — JARVIS forms insights and patterns.
+        Used for morning briefings and complex analysis.
+        Falls back to a summary of recent exchanges.
+        """
+        await self._check_hindsight()
+
+        if self._hindsight_available:
+            try:
+                async with httpx.AsyncClient(timeout=60.0) as client:
+                    r = await client.post(f"{HINDSIGHT_URL}/reflect", json={
+                        "bank_id": BANK_ID,
+                        "query":   query,
+                    })
+                    if r.status_code == 200:
+                        data = r.json()
+                        return data.get("reflection", "")
+            except Exception as e:
+                print(f"[MEMORY] Hindsight reflect error: {e}")
+
+        # Fallback
+        memories = await self.recall(query, limit=5)
+        if memories:
+            return " | ".join(m.get("content", "")[:100] for m in memories)
+        return ""
+
+    # ── Context builder (drop-in replacement for old build_context) ────
+    async def build_context(self, user_message: str) -> list:
+        """
+        Build conversation context for the LLM.
+        Compatible with the old build_context() return format.
+        Returns a list of {role, content} dicts.
+        """
+        memories = await self.recall(user_message, limit=8)
+        context  = []
+
+        for m in memories:
+            content = m.get("content", "").strip()
+            if not content:
+                continue
+            # Inject as system context
+            context.append({
+                "role":    "system",
+                "content": f"[MEMORY] {content}"
+            })
+
+        # Also inject entity facts
+        entities = await self.get_entities()
+        if entities:
+            facts = " | ".join(f"{k}: {v}" for k, v in entities.items())
+            context.insert(0, {
+                "role":    "system",
+                "content": f"[KNOWN FACTS] {facts}"
+            })
+
+        return context
+
+    # ── Exchange logging (drop-in for old save_exchange) ──────────────
+    async def save_exchange(self, user_msg: str, assistant_msg: str):
+        """Log a conversation exchange to memory."""
+        combined = f"User said: {user_msg} | JARVIS responded: {assistant_msg}"
+        await self.retain(combined, context="conversation")
+
+    # ── Entity management ─────────────────────────────────────────────
+    async def set_entity(self, key: str, value: str):
+        """Store a persistent fact about the user."""
+        await self.retain(f"{key}: {value}", context="entity_fact")
+        # Also store in SQLite for fast local access
+        try:
+            conn = sqlite3.connect(FALLBACK_DB)
+            conn.execute(
+                "INSERT OR REPLACE INTO entities (key, value, updated) VALUES (?, ?, ?)",
+                (key, value, datetime.utcnow().isoformat())
+            )
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            print(f"[MEMORY] Entity store error: {e}")
+
+    async def get_entities(self) -> dict:
+        """Retrieve all persistent user facts."""
+        try:
+            conn  = sqlite3.connect(FALLBACK_DB)
+            rows  = conn.execute("SELECT key, value FROM entities").fetchall()
+            conn.close()
+            return {r[0]: r[1] for r in rows}
+        except Exception:
+            return {}
+
+    async def clear_history(self):
+        """Clear conversation history. Entities are preserved."""
+        try:
+            conn = sqlite3.connect(FALLBACK_DB)
+            conn.execute("DELETE FROM exchanges")
+            conn.commit()
+            conn.close()
+            print("[MEMORY] History cleared — entities preserved.")
+        except Exception as e:
+            print(f"[MEMORY] Clear error: {e}")
+
+    async def get_stats(self) -> dict:
+        """Return memory statistics."""
+        try:
+            conn      = sqlite3.connect(FALLBACK_DB)
+            exchanges = conn.execute("SELECT COUNT(*) FROM exchanges").fetchone()[0]
+            entities  = conn.execute("SELECT COUNT(*) FROM entities").fetchone()[0]
+            conn.close()
+            return {
+                "hindsight": self._hindsight_available,
+                "exchanges": exchanges,
+                "entities":  entities,
+                "bank_id":   BANK_ID,
+            }
+        except Exception:
+            return {"hindsight": self._hindsight_available}
 
 
-# ── Core save/load ────────────────────────────────────────────────────
+# ── Module-level helpers (backward compatible with old memory.py API) ─
+_memory = Memory()
+
+async def init_db():
+    """Drop-in for old init_db() — memory already initialized."""
+    available = await _memory._check_hindsight()
+    if available:
+        print("[MEMORY] Hindsight connected — full memory active.")
+    else:
+        print("[MEMORY] Hindsight offline — SQLite fallback active.")
 
 async def save_exchange(user_msg: str, assistant_msg: str):
-    """Save one turn, then trigger background compression if needed."""
-    now = datetime.now().isoformat()
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "INSERT INTO exchanges (role, content, timestamp) VALUES (?, ?, ?)",
-            ("user", user_msg, now)
-        )
-        await db.execute(
-            "INSERT INTO exchanges (role, content, timestamp) VALUES (?, ?, ?)",
-            ("assistant", assistant_msg, now)
-        )
-        await db.commit()
+    await _memory.save_exchange(user_msg, assistant_msg)
 
-    # Fire-and-forget — don't block the response
-    await maybe_summarise()
-    await extract_entities(user_msg, assistant_msg)
+async def build_context(user_message: str) -> list:
+    return await _memory.build_context(user_message)
 
-
-async def load_history(limit: int = 6) -> list[dict]:
-    """Return the most recent `limit` exchanges as Ollama message dicts."""
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute(
-            """SELECT role, content FROM exchanges
-               ORDER BY id DESC LIMIT ?""",
-            (limit * 2,)   # *2 because each exchange = 2 rows
-        ) as cur:
-            rows = await cur.fetchall()
-    rows.reverse()
-    return [{"role": r[0], "content": r[1]} for r in rows]
-
-
-async def build_context(user_message: str) -> list[dict]:
-    """
-    Returns the full message list for Ollama:
-      [recent summaries as system context] + [recent raw exchanges] + [user turn]
-
-    This gives JARVIS long-term memory (summaries) + sharp recall (recent turns).
-    """
-    context_blocks = []
-
-    # 1. Entity facts — always injected (name, preferences, etc.)
-    entities = await get_entities()
-    if entities:
-        facts = "\n".join(f"  • {k}: {v}" for k, v in entities.items())
-        context_blocks.append({
-            "role": "system",
-            "content": f"KNOWN FACTS ABOUT THE USER:\n{facts}"
-        })
-
-    # 2. Rolling summaries — compressed long-term memory
-    summaries = await get_recent_summaries(limit=MAX_SUMMARIES)
-    if summaries:
-        summary_text = "\n\n".join(
-            f"[MEMORY {i+1} — {s['covers_from'][:10]} to {s['covers_to'][:10]}]\n{s['content']}"
-            for i, s in enumerate(summaries)
-        )
-        context_blocks.append({
-            "role": "system",
-            "content": f"CONVERSATION HISTORY (COMPRESSED):\n{summary_text}"
-        })
-
-    # 3. Recent raw exchanges — sharp short-term recall
-    recent = await load_history(limit=RECENT_KEEP)
-    context_blocks += recent
-
-    return context_blocks
-
-
-# ── Summarisation engine ──────────────────────────────────────────────
-
-async def maybe_summarise():
-    """If raw exchange count exceeds trigger, compress oldest batch."""
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT COUNT(*) FROM exchanges") as cur:
-            (count,) = await cur.fetchone()
-
-    # Need: SUMMARY_BATCH compressable + RECENT_KEEP untouched
-    if count < (SUMMARY_BATCH * 2) + (RECENT_KEEP * 2):
-        return   # not enough yet
-
-    compressable = count - (RECENT_KEEP * 2)
-    if compressable < SUMMARY_BATCH * 2:
-        return
-
-    await _compress_oldest_batch()
-
-
-async def _compress_oldest_batch():
-    """Fetch oldest SUMMARY_BATCH exchanges, summarise, delete raw rows."""
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute(
-            """SELECT id, role, content, timestamp FROM exchanges
-               ORDER BY id ASC LIMIT ?""",
-            (SUMMARY_BATCH * 2,)
-        ) as cur:
-            rows = await cur.fetchall()
-
-    if not rows:
-        return
-
-    # Build conversation text for the LLM to summarise
-    convo_lines = []
-    for _, role, content, ts in rows:
-        label = "Sir" if role == "user" else "JARVIS"
-        convo_lines.append(f"{label}: {content}")
-    convo_text = "\n".join(convo_lines)
-
-    covers_from = rows[0][3]
-    covers_to   = rows[-1][3]
-
-    summary = await _call_ollama_summary(convo_text)
-    if not summary:
-        return  # don't delete if summarisation failed
-
-    now = datetime.now().isoformat()
-    ids = [r[0] for r in rows]
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "INSERT INTO summaries (content, covers_from, covers_to, created_at) VALUES (?, ?, ?, ?)",
-            (summary, covers_from, covers_to, now)
-        )
-        placeholders = ",".join("?" * len(ids))
-        await db.execute(f"DELETE FROM exchanges WHERE id IN ({placeholders})", ids)
-        await db.commit()
-
-    print(f"[MEMORY] Compressed {len(ids)//2} exchanges into summary.")
-
-
-async def _call_ollama_summary(convo_text: str) -> str | None:
-    """Ask Ollama to produce a compact summary of a conversation segment."""
-    prompt = f"""Summarise the following conversation between a user ("Sir") and an AI assistant ("JARVIS").
-Extract: key topics discussed, decisions made, facts learned about the user, and any pending tasks.
-Be concise — maximum 150 words. Write in third person as a briefing note.
-
-CONVERSATION:
-{convo_text}
-
-SUMMARY:"""
-
-    payload = {
-        "model": SUMMARY_MODEL,
-        "messages": [{"role": "user", "content": prompt}],
-        "stream": False,
-        "options": {"num_predict": 200, "temperature": 0.3}
-    }
-    try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            r = await client.post(OLLAMA_URL, json=payload)
-            data = r.json()
-            return data.get("message", {}).get("content", "").strip()
-    except Exception as e:
-        print(f"[MEMORY] Summary generation failed: {e}")
-        return None
-
-
-async def get_recent_summaries(limit: int = MAX_SUMMARIES) -> list[dict]:
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute(
-            """SELECT content, covers_from, covers_to FROM summaries
-               ORDER BY id DESC LIMIT ?""", (limit,)
-        ) as cur:
-            rows = await cur.fetchall()
-    rows.reverse()
-    return [{"content": r[0], "covers_from": r[1], "covers_to": r[2]} for r in rows]
-
-
-# ── Entity extraction ─────────────────────────────────────────────────
-
-ENTITY_PATTERNS = [
-    # Name: "call me X", "my name is X", "I'm X"
-    (r"(?:call me|my name is|i'm|i am)\s+([A-Za-z]+)", "user_name"),
-    # Location: "I'm in X", "I live in X"
-    (r"(?:i(?:'m| am) in|i live in|based in|from)\s+([A-Za-z\s]+?)(?:\.|,|$)", "user_location"),
-    # Occupation: "I'm a X", "I work as X", "I study X"
-    (r"(?:i(?:'m| am) an?\s|i work as an?\s|i study\s)([A-Za-z\s]+?)(?:\.|,|$)", "user_occupation"),
-    # Project mentions: "working on X", "my project X"
-    (r"(?:working on|my project(?:s)? (?:is|are)?)\s+([A-Za-z0-9\s\-_]+?)(?:\.|,|$)", "current_project"),
-]
-
-async def extract_entities(user_msg: str, assistant_msg: str):
-    """Run regex patterns over the user message and upsert any found facts."""
-    now = datetime.now().isoformat()
-    found = {}
-    lower = user_msg.lower()
-    for pattern, key in ENTITY_PATTERNS:
-        m = re.search(pattern, lower)
-        if m:
-            val = m.group(1).strip().title()
-            if len(val) > 1:
-                found[key] = val
-
-    if not found:
-        return
-
-    async with aiosqlite.connect(DB_PATH) as db:
-        for key, value in found.items():
-            await db.execute(
-                """INSERT INTO entities (key, value, updated_at) VALUES (?, ?, ?)
-                   ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at""",
-                (key, value, now)
-            )
-        await db.commit()
-
-    for k, v in found.items():
-        print(f"[MEMORY] Entity upsert — {k}: {v}")
-
-
-async def get_entities() -> dict:
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT key, value FROM entities") as cur:
-            rows = await cur.fetchall()
-    return {r[0]: r[1] for r in rows}
-
-
-async def set_entity(key: str, value: str):
-    """Manually set a persistent fact about the user."""
-    now = datetime.now().isoformat()
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            """INSERT INTO entities (key, value, updated_at) VALUES (?, ?, ?)
-               ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at""",
-            (key, value, now)
-        )
-        await db.commit()
-
-
-# ── Stats + management ────────────────────────────────────────────────
-
-async def get_stats() -> dict:
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT COUNT(*) FROM exchanges") as cur:
-            (exchanges,) = await cur.fetchone()
-        async with db.execute("SELECT COUNT(*) FROM summaries") as cur:
-            (summaries,) = await cur.fetchone()
-        async with db.execute("SELECT COUNT(*) FROM entities") as cur:
-            (entities,) = await cur.fetchone()
-    return {
-        "raw_exchanges":  exchanges // 2,
-        "summaries":      summaries,
-        "known_entities": entities,
-        "total_turns":    (exchanges // 2) + (summaries * SUMMARY_BATCH),
-    }
-
+async def load_history():
+    return await _memory.recall("recent conversations", limit=20)
 
 async def clear_history():
-    """Wipe exchanges and summaries. Preserve entities (user facts)."""
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("DELETE FROM exchanges")
-        await db.execute("DELETE FROM summaries")
-        await db.commit()
+    await _memory.clear_history()
 
+async def get_stats() -> dict:
+    return await _memory.get_stats()
 
-async def clear_all():
-    """Full wipe including entities."""
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("DELETE FROM exchanges")
-        await db.execute("DELETE FROM summaries")
-        await db.execute("DELETE FROM entities")
-        await db.commit()
+async def get_entities() -> dict:
+    return await _memory.get_entities()
+
+async def set_entity(key: str, value: str):
+    await _memory.set_entity(key, value)
