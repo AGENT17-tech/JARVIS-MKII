@@ -17,6 +17,8 @@ from actions import TOOLS, execute_tool
 from memory import init_db, save_exchange, load_history, build_context, clear_history, get_stats, get_entities, set_entity
 from world_state import world_state
 from sensors import register_all_sensors
+from agent_router import router
+from agents import register_all_agents
 from scheduler import scheduler
 from vault import vault
 from sandbox import sandbox
@@ -432,6 +434,7 @@ async def startup():
     _voice_task = asyncio.create_task(voice_pipeline())
     await world_state.start()
     register_all_sensors(world_state)
+    register_all_agents(router)
     await scheduler.start(world_state, None, broadcast)
     _voice_task.add_done_callback(
         lambda t: print(f"[JARVIS] Voice task ended: {t.exception() if not t.cancelled() else 'cancelled'}")
