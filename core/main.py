@@ -649,3 +649,25 @@ class EntityPayload(BaseModel):
 async def memory_set_entity(payload: EntityPayload):
     await set_entity(payload.key, payload.value)
     return {"status": "entity saved", "key": payload.key, "value": payload.value}
+
+# ── World State + Scheduler endpoints ────────────────────────────────
+@app.get("/world_state")
+async def world_state_endpoint():
+    return world_state.get()
+
+@app.get("/world_state/summary")
+async def world_state_summary():
+    return {"summary": world_state.summary()}
+
+@app.get("/scheduler/status")
+async def scheduler_status_endpoint():
+    import time as _time
+    now = _time.time()
+    triggers = []
+    for t in scheduler.triggers:
+        since = round((now - t.last_fired) / 60) if t.last_fired else None
+        triggers.append({
+            "name": t.name, "action": t.action,
+            "priority": t.priority, "last_fired": since,
+        })
+    return {"running": scheduler._running, "triggers": triggers}
