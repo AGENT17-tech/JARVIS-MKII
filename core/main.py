@@ -16,6 +16,7 @@ from voice import listen_for_wakeword, record_command, transcribe, speak, speak_
 from actions import TOOLS, execute_tool
 from memory import init_db, save_exchange, load_history, build_context, clear_history, get_stats, get_entities, set_entity
 from world_state import world_state
+from sensors import register_all_sensors
 from scheduler import scheduler
 from vault import vault
 from sandbox import sandbox
@@ -430,6 +431,7 @@ async def startup():
     print("[JARVIS] Memory database initialized.")
     _voice_task = asyncio.create_task(voice_pipeline())
     await world_state.start()
+    register_all_sensors(world_state)
     await scheduler.start(world_state, None, broadcast)
     _voice_task.add_done_callback(
         lambda t: print(f"[JARVIS] Voice task ended: {t.exception() if not t.cancelled() else 'cancelled'}")
