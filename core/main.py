@@ -15,6 +15,10 @@ from dotenv import load_dotenv
 from voice import listen_for_wakeword, record_command, transcribe, speak, speak_sentence, split_sentences
 from actions import TOOLS, execute_tool
 from memory import init_db, save_exchange, load_history, build_context, clear_history, get_stats, get_entities, set_entity
+from world_state import world_state
+from scheduler import scheduler
+from vault import vault
+from sandbox import sandbox
 from vision import analyse_screen, analyse_image, get_vision_context
 
 load_dotenv()
@@ -425,6 +429,8 @@ async def startup():
     await init_db()
     print("[JARVIS] Memory database initialized.")
     _voice_task = asyncio.create_task(voice_pipeline())
+    await world_state.start()
+    await scheduler.start(world_state, None, broadcast)
     _voice_task.add_done_callback(
         lambda t: print(f"[JARVIS] Voice task ended: {t.exception() if not t.cancelled() else 'cancelled'}")
     )
