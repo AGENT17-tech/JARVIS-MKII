@@ -77,12 +77,14 @@ class Memory:
         if self._hindsight_available:
             try:
                 async with httpx.AsyncClient(timeout=30.0) as client:
-                    payload = {"bank_id": BANK_ID, "content": content}
+                    item = {"content": content}
                     if context:
-                        payload["context"] = context
-                    r = await client.post(f"{HINDSIGHT_URL}/retain", json=payload)
-                    if r.status_code == 200:
+                        item["context"] = context
+                    payload = {"items": [item], "async": True}
+                    r = await client.post(f"{HINDSIGHT_URL}/v1/default/banks/{BANK_ID}/memories", json=payload)
+                    if r.status_code in (200, 201, 202):
                         return True
+                    print(f"[MEMORY] Retain status: {r.status_code} — {r.text[:100]}")
             except Exception as e:
                 print(f"[MEMORY] Hindsight retain error: {e}")
 
@@ -111,14 +113,23 @@ class Memory:
         if self._hindsight_available:
             try:
                 async with httpx.AsyncClient(timeout=30.0) as client:
-                    r = await client.post(f"{HINDSIGHT_URL}/recall", json={
-                        "bank_id": BANK_ID,
-                        "query":   query,
-                        "limit":   limit,
+                    r = await client.post(f"{HINDSIGHT_URL}/v1/default/banks/{BANK_ID}/memories/recall", json={
+                        "query":      query,
+                        "max_tokens": 2048,
+                        "budget":     "mid",
+                        "types":      ["world", "experience"],
                     })
                     if r.status_code == 200:
                         data = r.json()
-                        return data.get("memories", [])
+                        # Hindsight returns {results: [{text, type, entities...}]}
+                        raw = data.get("results", [])
+                        results = []
+                        for m in raw[:limit]:
+                            c = m.get("text") or m.get("content") or ""
+                            if c:
+                                results.append({"content": c})
+                        return results
+                    print(f"[MEMORY] Recall status: {r.status_code} — {r.text[:100]}")
             except Exception as e:
                 print(f"[MEMORY] Hindsight recall error: {e}")
 
