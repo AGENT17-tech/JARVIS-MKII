@@ -1,124 +1,163 @@
 """
 buc_sensor.py — JARVIS MKIII BUC Portal Sensor
-Monitors British University in Cairo portal for:
-- Grade updates
-- Announcements
-- Exam schedules
-- Assignment deadlines
-
-Uses Playwright headless browser.
-
-Setup:
-    python3 vault.py store BUC_USERNAME your_student_id
-    python3 vault.py store BUC_PASSWORD your_password
-    python3 vault.py store BUC_URL https://your-portal-url.buc.edu.eg
+Microsoft Office 365 SSO login for buc.melimu.com
 """
 
 import asyncio
-import os
+import sys, os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from vault import vault
 
 
 class BUCSensor:
     def __init__(self):
-        self._available    = False
-        self._last_data    = {}
-        self._login_tried  = False
+        self._last_data   = {}
+        self._login_tried = False
         print("[BUC SENSOR] Initialized.")
 
     async def read(self) -> dict:
-        """Scrape BUC portal and return world state update."""
         username = vault.get("BUC_USERNAME")
         password = vault.get("BUC_PASSWORD")
         url      = vault.get("BUC_URL")
 
         if not username or not password or not url:
-            # Return last known data or defaults
-            return self._last_data or {
-                "buc_portal": {
-                    "grades_updated":  False,
-                    "announcements":   0,
-                    "next_exam":       "",
-                    "days_to_exam":    99,
-                }
-            }
+            return self._last_data or self._default()
 
         try:
             from playwright.async_api import async_playwright
 
             async with async_playwright() as p:
                 browser = await p.chromium.launch(headless=True)
-                page    = await browser.new_page()
+                context = await browser.new_context()
+                page    = await context.new_page()
 
-                # Navigate to portal
-                await page.goto(url, timeout=15000)
+                print("[BUC SENSOR] Navigating to portal...")
+                await page.goto(url, timeout=20000)
+                await page.wait_for_load_state("networkidle", timeout=10000)
 
-                # Login if needed
+                # Step 1: Click Microsoft login
                 try:
-                    if await page.is_visible("input[type='password']", timeout=3000):
-                        await page.fill("input[name='username'], input[type='text']", username)
-                        await page.fill("input[type='password']", password)
-                        await page.click("button[type='submit'], input[type='submit']")
-                        await page.wait_for_load_state("networkidle", timeout=10000)
-                except Exception:
-                    pass
-
-                # Scrape announcements
-                announcements = 0
-                try:
-                    ann_elements = await page.query_selector_all(
-                        ".announcement, .notice, [class*='announce'], [class*='notice']"
+                    await page.click(
+                        "a[href*='microsoft'], a[href*='oauth'], "
+                        "a:has-text('Microsoft'), a:has-text('Office')",
+                        timeout=5000
                     )
-                    announcements = len(ann_elements)
+                    print("[BUC SENSOR] Clicked Microsoft button.")
+                    await page.wait_for_load_state("networkidle", timeout=10000)
+                except Exception:
+                    print("[BUC SENSOR] No Microsoft button — already on MS page.")
+
+                # Step 2: Email
+                try:
+                    await page.wait_for_selector(
+                        "input[type='email'], input[name='loginfmt']",
+                        timeout=8000)
+                    await page.fill(
+                        "input[type='email'], input[name='loginfmt']", username)
+                    await page.click("input[type='submit'], button[type='submit'], #idSIButton9")
+                    await page.wait_for_load_state("networkidle", timeout=8000)
+                    print("[BUC SENSOR] Email submitted.")
+                except Exception as e:
+                    print(f"[BUC SENSOR] Email error: {e}")
+                    await browser.close()
+                    return self._last_data or self._default()
+
+                # Step 3: Password
+                try:
+                    await page.wait_for_selector(
+                        "input[type='password'], input[name='passwd']",
+                        timeout=8000)
+                    await page.fill(
+                        "input[type='password'], input[name='passwd']", password)
+                    await page.click("input[type='submit'], button[type='submit'], #idSIButton9")
+                    print("[BUC SENSOR] Password submitted — waiting for redirect...")
+                    # Wait for redirect back to melimu
+                    await page.wait_for_load_state("networkidle", timeout=20000)
+                except Exception as e:
+                    print(f"[BUC SENSOR] Password error: {e}")
+                    await browser.close()
+                    return self._last_data or self._default()
+
+                # Step 4: Stay signed in prompt
+                try:
+                    await page.click("#idBtn_Back, input[value='No']", timeout=4000)
+                    await page.wait_for_load_state("networkidle", timeout=8000)
+                    print("[BUC SENSOR] Dismissed stay signed in.")
                 except Exception:
                     pass
 
-                # Scrape grade updates
+                # Wait extra for final redirect
+                await asyncio.sleep(3)
+                current_url = page.url
+                print(f"[BUC SENSOR] Final URL: {current_url[:70]}")
+
+                # Step 5: Scrape
+                announcements  = 0
                 grades_updated = False
+                assignments    = []
+
                 try:
-                    grade_elements = await page.query_selector_all(
-                        ".grade-new, .updated-grade, [class*='grade'][class*='new']"
-                    )
-                    grades_updated = len(grade_elements) > 0
+                    ann = await page.query_selector_all(
+                        ".activity, .section, [data-region], .course-section")
+                    announcements = max(0, len(ann) - 5)
+                except Exception:
+                    pass
+
+                try:
+                    grade_els = await page.query_selector_all(
+                        ".graded, .newgrade, [class*='grade']")
+                    grades_updated = len(grade_els) > 0
+                except Exception:
+                    pass
+
+                try:
+                    assign_els = await page.query_selector_all(
+                        ".activity.assign .instancename, "
+                        "[data-activityname]")
+                    for el in assign_els[:5]:
+                        text = await el.inner_text()
+                        if text.strip():
+                            assignments.append(text.strip()[:60])
                 except Exception:
                     pass
 
                 await browser.close()
 
+                landed_on_portal = "melimu.com" in current_url
+
                 result = {
                     "buc_portal": {
                         "grades_updated": grades_updated,
                         "announcements":  announcements,
-                        "next_exam":      self._last_data.get("buc_portal", {}).get("next_exam", ""),
-                        "days_to_exam":   self._last_data.get("buc_portal", {}).get("days_to_exam", 99),
+                        "assignments":    assignments,
+                        "next_exam":      "",
+                        "days_to_exam":   99,
+                        "logged_in":      landed_on_portal,
                     }
                 }
                 self._last_data = result
-                print(f"[BUC SENSOR] Scraped — announcements:{announcements} grades_updated:{grades_updated}")
+                print(f"[BUC SENSOR] Done — logged_in:{landed_on_portal} "
+                      f"announcements:{announcements} assignments:{len(assignments)}")
                 return result
 
         except Exception as e:
-            print(f"[BUC SENSOR] Scrape error: {e}")
-            return self._last_data or {}
+            print(f"[BUC SENSOR] Error: {e}")
+            return self._last_data or self._default()
+
+    def _default(self):
+        return {"buc_portal": {
+            "grades_updated": False, "announcements": 0,
+            "assignments": [], "next_exam": "",
+            "days_to_exam": 99, "logged_in": False}}
 
 
 buc_sensor = BUCSensor()
 
 if __name__ == "__main__":
     async def test():
-        print("[TEST] BUC sensor...")
-        username = vault.get("BUC_USERNAME")
-        if not username:
-            print("[TEST] No BUC credentials in vault.")
-            print("       Run:")
-            print("       python3 vault.py store BUC_USERNAME your_id")
-            print("       python3 vault.py store BUC_PASSWORD your_password")
-            print("       python3 vault.py store BUC_URL https://portal.buc.edu.eg")
-            print("[TEST] BUC skipped — not configured.")
-        else:
-            result = await buc_sensor.read()
-            buc = result.get("buc_portal", {})
-            print(f"Announcements:  {buc.get('announcements', 0)}")
-            print(f"Grades updated: {buc.get('grades_updated', False)}")
-            print("[TEST] BUC PASS")
+        result = await buc_sensor.read()
+        buc = result.get("buc_portal", {})
+        print(f"Logged in:     {buc.get('logged_in')}")
+        print(f"Announcements: {buc.get('announcements')}")
+        print(f"Assignments:   {buc.get('assignments')}")
     asyncio.run(test())
