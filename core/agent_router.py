@@ -59,6 +59,50 @@ def detect_intent(message: str) -> list:
     return intents or ["default"]
 
 
+
+# ── Query complexity tiers ────────────────────────────────────────────
+SIMPLE_PATTERNS = [
+    "hello", "hi", "hey", "what time", "who are you",
+    "thanks", "thank you", "ok", "okay", "yes", "no", "good morning",
+    "good night", "how are you", "what is your name",
+]
+
+KNOWLEDGE_PATTERNS = [
+    "what is", "what are", "what was", "what were", "who is", "who was",
+    "how does", "how do", "tell me about", "explain what", "define",
+    "meaning of", "what does", "describe",
+]
+
+KNOWLEDGE_PATTERNS = [
+    "what is", "what are", "what was", "what were", "who is", "who was",
+    "how does", "how do", "tell me about", "explain what", "define",
+    "meaning of", "what does", "describe",
+]
+
+COMPLEX_PATTERNS = [
+    "explain", "analyse", "analyze", "compare", "research", "write",
+    "summarise", "summarize", "design", "implement", "architecture",
+    "difference between", "how does", "why does", "what are the",
+    "pros and cons", "step by step", "in detail", "comprehensive",
+]
+
+def classify_complexity(message: str) -> str:
+    """Returns: simple | medium | complex"""
+    msg_lower = message.lower()
+    if any(p in msg_lower for p in COMPLEX_PATTERNS) or len(message.split()) > 20:
+        return "complex"
+    if any(p in msg_lower for p in KNOWLEDGE_PATTERNS):
+        return "medium"
+    if any(p in msg_lower for p in SIMPLE_PATTERNS) and len(message.split()) < 6:
+        return "simple"
+    return "medium"
+
+MODEL_TIER = {
+    "simple":  "qwen3:1.7b",
+    "medium":  "llama3.2:3b",
+    "complex": "llama3.1:8b",
+}
+
 class AgentRouter:
     def __init__(self):
         self._agents = {}
@@ -74,13 +118,17 @@ class AgentRouter:
         Returns synthesised response.
         """
         intents = detect_intent(message)
-        print(f"[ROUTER] Message: '{message[:60]}' → intents: {intents}")
+        complexity = classify_complexity(message)
+        tier_model = MODEL_TIER[complexity]
+        print(f"[ROUTER] Message: '{message[:60]}' → intents: {intents} | tier: {complexity} ({tier_model})")
 
         # Single intent — direct route
         if len(intents) == 1:
             agent_name = intents[0]
             agent = self._agents.get(agent_name) or self._agents.get("default")
             if agent:
+                if agent_name == "default" and hasattr(agent, "run"):
+                    return await agent.run(message, context or [], model=tier_model)
                 return await agent.run(message, context or [])
 
         # Multiple intents — parallel execution

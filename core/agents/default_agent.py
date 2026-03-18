@@ -15,16 +15,17 @@ Be precise, composed, and brief. Address the user as 'sir'. No fluff."""
 
 
 class DefaultAgent:
-    async def run(self, message: str, context: list = None) -> str:
+    async def run(self, message: str, context: list = None, model: str = None) -> str:
         messages = [{"role": "system", "content": SYSTEM}]
         if context:
             messages += [m for m in context if m.get("content", "").strip()]
         messages.append({"role": "user", "content": message})
+        use_model = model or MODEL
 
         try:
             async with httpx.AsyncClient(timeout=60.0) as client:
                 r = await client.post(OLLAMA_URL, json={
-                    "model":    MODEL,
+                    "model":    use_model,
                     "messages": messages,
                     "stream":   False,
                     "options":  OPTIONS,
