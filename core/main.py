@@ -18,6 +18,7 @@ from memory import init_db, save_exchange, load_history, build_context, clear_hi
 from world_state import world_state
 from sensors import register_all_sensors
 from agent_router import router
+from cloud_fallback import cloud_fallback, should_fallback
 from agents import register_all_agents
 from scheduler import scheduler
 from vault import vault
@@ -364,9 +365,21 @@ async def stream_ollama(user_message: str):
                     except (json.JSONDecodeError, KeyError):
                         continue
     except Exception as e:
-        print(f"[JARVIS] Ollama stream error: {e}")
-        yield "Apologies, sir. Connection to the local model failed."
+        print(f"[JARVIS] Ollama stream error: {e} — attempting cloud fallback.")
+        if cloud_fallback._available:
+            messages = await build_messages(user_message, "")
+            async for token in cloud_fallback.stream(messages):
+                yield token
+        else:
+            yield "Apologies, sir. Local model failed and cloud fallback is unavailable."
         return
+
+    # Cloud fallback for explicit trigger phrases
+    if should_fallback(user_message) and cloud_fallback._available:
+        print(f"[JARVIS] Cloud fallback triggered by user request.")
+        messages = await build_messages(user_message, "")
+        async for token in cloud_fallback.stream(messages):
+            yield token
 
     print(f"[JARVIS] Ollama response: {len(full_response)} chars")
     if sentence_buffer.strip():
@@ -432,6 +445,12 @@ async def startup():
     await init_db()
     print("[JARVIS] Memory database initialized.")
     _voice_task = asyncio.create_task(voice_pipeline())
+    # Load cloud keys from vault into environment
+    import os as _os
+    _gemini_key = vault.get("GEMINI_API_KEY")
+    _gemini_model = vault.get("GEMINI_MODEL")
+    if _gemini_key: _os.environ["GEMINI_API_KEY"] = _gemini_key
+    if _gemini_model: _os.environ["GEMINI_MODEL"] = _gemini_model
     await world_state.start()
     register_all_sensors(world_state)
     register_all_agents(router)
