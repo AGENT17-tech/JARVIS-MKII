@@ -284,3 +284,6 @@ async def get_entities() -> dict:
 
 async def set_entity(key: str, value: str):
     await _memory.set_entity(key, value)
+
+async def recall(query: str, limit: int = 10) -> list:
+    return await _memory.recall(query, limit)
